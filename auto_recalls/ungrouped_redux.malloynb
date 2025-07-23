@@ -1,0 +1,172 @@
+>>>markdown
+# Ungrouped expressions can sometimes be written without cross joins
+When using the 'all(x)', we can sometime use sum_window(x).  In a flat query (query without nests), we can avoid CROSS JOIN / combine stages.  For a real win.
+
+We can only do this on regular sums and count() when the data is not fanned out.
+
+I'm thinking we need something between the parser and the code generator that walks the query and optimizes it.
+>>>malloy
+import {recalls} from "auto_recalls.malloy"
+>>>markdown
+## Basic case.
+>>>malloy
+run: recalls -> {
+    group_by: Manufacturer
+    aggregate: 
+        recall_count
+        all_recalls is all(recall_count)
+    limit: 4
+}
+>>>markdown
+### Generated SQL
+Notice the cross join below.
+>>>sql
+-- connection: duckdb
+
+WITH __stage0 AS (
+  SELECT
+    group_set,
+    CASE WHEN group_set=1 THEN
+      base."Manufacturer"
+      END as "Manufacturer__1",
+    CASE WHEN group_set=1 THEN
+      COUNT(1)
+      END as "recall_count__1",
+    MAX((CASE WHEN group_set=0 THEN
+      COUNT(1)
+      END)) OVER () as "all_recalls__1"
+  FROM auto_recalls.csv as base
+  CROSS JOIN (SELECT UNNEST(GENERATE_SERIES(0,1,1)) as group_set  ) as group_set
+  GROUP BY 1,2
+)
+SELECT
+  "Manufacturer__1" as "Manufacturer",
+  MAX(CASE WHEN group_set=1 THEN "recall_count__1" END) as "recall_count",
+  MAX(CASE WHEN group_set=1 THEN "all_recalls__1" END) as "all_recalls"
+FROM __stage0
+WHERE group_set NOT IN (0)
+GROUP BY 1
+ORDER BY 2 desc NULLS LAST
+LIMIT 4
+>>>markdown
+### Simplified SQL
+
+The following SQL generates the same results.
+>>>sql
+
+SELECT
+      base."Manufacturer",
+      count(1) as recall_count,
+      sum(count(1)) over () as all_recalls,
+  FROM auto_recalls.csv as base
+GROUP BY 1
+ORDER BY 2 desc NULLS LAST
+LIMIT 4
+>>>markdown
+### Re-write the Malloy
+We can actually represent this query in Malloy and SQL query will also be simple
+>>>malloy
+run: recalls -> {
+    group_by: Manufacturer
+    aggregate: 
+        recall_count
+    calculate:
+        all_recalls is sum_window(recall_count)
+    limit: 4
+}
+>>>markdown
+And the generated SQL
+>>>sql
+SELECT 
+   base."Manufacturer" as "Manufacturer",
+   COUNT(1) as "recall_count",
+   SUM((COUNT(1))) OVER(  ) as "all_recalls"
+FROM auto_recalls.csv as base
+GROUP BY 1
+ORDER BY 2 desc NULLS LAST
+LIMIT 4
+>>>markdown
+### Nested case
+Works just fine with all(x) -> sum_window(x)
+>>>malloy
+run: recalls -> {
+    group_by: `Recall Type`
+    aggregate: 
+        recall_count
+    nest: by_manufacturer is {
+        group_by: Manufacturer
+        aggregate: 
+            recall_count
+            all_recalls is all(recall_count)
+        limit: 4 
+    }
+}
+>>>markdown
+And the SQL
+>>>sql
+WITH __stage0 AS (
+  SELECT
+    group_set,
+    base."Recall Type" as "Recall Type__0",
+    CASE WHEN group_set=0 THEN
+      COUNT(1)
+      END as "recall_count__0",
+    CASE WHEN group_set=1 THEN
+      base."Manufacturer"
+      END as "Manufacturer__1",
+    CASE WHEN group_set=1 THEN
+      COUNT(1)
+      END as "recall_count__1",
+    MAX((CASE WHEN group_set=0 THEN
+      COUNT(1)
+      END)) OVER (PARTITION BY base."Recall Type") as "all_recalls__1"
+  FROM auto_recalls.csv as base
+  CROSS JOIN (SELECT UNNEST(GENERATE_SERIES(0,1,1)) as group_set  ) as group_set
+  GROUP BY 1,2,4
+)
+SELECT
+  "Recall Type__0" as "Recall Type",
+  MAX(CASE WHEN group_set=0 THEN "recall_count__0" END) as "recall_count",
+  COALESCE(LIST({
+    "Manufacturer": "Manufacturer__1", 
+    "recall_count": "recall_count__1", 
+    "all_recalls": "all_recalls__1"}  ORDER BY  "recall_count__1" desc NULLS LAST) FILTER (WHERE group_set=1)[1:4],[]) as "by_manufacturer"
+FROM __stage0
+GROUP BY 1
+ORDER BY 2 desc NULLS LAST
+>>>malloy
+run: recalls -> {
+    group_by: `Recall Type`
+    aggregate: 
+        recall_count
+    nest: by_manufacturer is {
+        group_by: Manufacturer
+        aggregate: 
+            recall_count
+        calculate:
+            all_recalls is sum_window(recall_count)
+        limit: 4 
+    }
+}
+>>>markdown
+### THE SUM(DISTINCT) and COUNT(DISTINCT) functions 
+Can't be uses in this way.  We need to rely on the current implementation.
+
+   `all(count(x)) != sum_window(count(x))`
+>>>malloy
+run: recalls -> {
+    nest: unoptimized is {
+        group_by: `Recall Type`
+        aggregate: 
+            manufacturer_count is count(Manufacturer)
+            all_manufacturers is all(count(Manufacturer))
+
+    }
+    nest: optimize_fail is {
+        group_by: `Recall Type`
+        aggregate: 
+            manufacturer_count is count(Manufacturer)
+        calculate:
+            all_manufacturers is sum_window(count(Manufacturer))
+    }
+}
