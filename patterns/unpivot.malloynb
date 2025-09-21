@@ -1,0 +1,29 @@
+>>>markdown
+# Unpivot Some data
+>>>malloy
+query: pivotted is duckdb.sql("""
+  SELECT 
+    'red' as color,
+    23 as data2023,
+    24 as data2024,
+    25 as data2025,
+  UNION
+   SELECT 
+    'blue' as color,
+    123 as data2023,
+    124 as data2024,
+    125 as data2025,
+""")
+
+source: unpivotted is pivotted -> {
+  select: *, all_years is [2023,2024,2025]
+} extend {
+  dimension: y is all_years.each
+  dimension: data is 
+     pick data2023 when y = 2023
+     pick data2024 when y = 2024
+     pick data2025 when y = 2025
+     else null
+}
+>>>malloy
+run: unpivotted -> {select: color, data, y}
